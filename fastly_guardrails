@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="fastly_guardrails"
+APP_MODULE="fastly_guardrails"
+MIN_PYTHON_MAJOR=3
+MIN_PYTHON_MINOR=9
+INSTALL_ROOT="${HOME}/.fastly_guardrails"
+APP_DIR="${INSTALL_ROOT}/app"
+VENV_DIR="${INSTALL_ROOT}/venv"
+CACHE_DIR="${INSTALL_ROOT}/cache"
+RECEIPT_PATH="${INSTALL_ROOT}/install_receipt.tsv"
+SENTINEL_PATH="${INSTALL_ROOT}/.fg_managed_root"
+LAUNCHER_DIR="${HOME}/.local/bin"
+LAUNCHER_PATH="${LAUNCHER_DIR}/${APP_NAME}"
+LAUNCHER_MARKER="# FASTLY_GUARDRAILS_MANAGED_LAUNCHER"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)"
+BUNDLED_APP_DIR="${SCRIPT_DIR}/app_src"
+PIP_INSTALL_EXTRA="[report]"
+
+USE_COLOR=0
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  USE_COLOR=1
+fi
+
+if [[ "$USE_COLOR" -eq 1 ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'
+else
+  BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""
+fi
+
+say() { printf "%b\n" "$*"; }
+info() { printf "%b\n" "${CYAN}•${RESET} $*"; }
+success() { printf "%b\n" "${GREEN}✓${RESET} $*"; }
+warn() { printf "%b\n" "${YELLOW}▲${RESET} $*" >&2; }
+die() { printf "%b\n" "${RED}ERROR:${RESET} $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+${BOLD}Fastly Guardrails Bootstrapper${RESET}
+
+Usage:
+  ./fastly_guardrails install [--yes]
+  fastly_guardrails doctor
+  fastly_guardrails uninstall [--dry-run] [--purge] [--yes]
+  fastly_guardrails scan <path> [...]
+  fastly_guardrails report <path> --output report.pdf [...]
+
+Notes:
+  • Install creates a managed environment under ${INSTALL_ROOT}
+  • A launcher is placed at ${LAUNCHER_PATH}
+  • Uninstall removes only the tool-owned managed paths and refuses on ambiguity
+EOF
+}
+
+is_macos() { [[ "$(uname -s)" == "Darwin" ]]; }
+
+ensure_safe_defaults() {
+  [[ -n "$HOME" ]] || die "HOME is not set."
+  [[ "$INSTALL_ROOT" == "$HOME/.fastly_guardrails" ]] || die "Install root safety check failed."
+  [[ "$LAUNCHER_PATH" == "$HOME/.local/bin/${APP_NAME}" ]] || die "Launcher path safety check failed."
+  [[ "$INSTALL_ROOT" != "/" && "$INSTALL_ROOT" != "$HOME" ]] || die "Refusing unsafe install root."
+}
+
+path_contains() {
+  local needle="$1"
+  case ":$PATH:" in
+    *":${needle}:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_shell_profile() {
+  local shell_name
+  shell_name="$(basename "${SHELL:-}")"
+
+  case "$shell_name" in
+    zsh)
+      printf '%s\n' "$HOME/.zshrc"
+      ;;
+    bash)
+      if [[ -f "$HOME/.bash_profile" || ! -f "$HOME/.bashrc" ]]; then
+        printf '%s\n' "$HOME/.bash_profile"
+      else
+        printf '%s\n' "$HOME/.bashrc"
+      fi
+      ;;
+    *)
+      printf '%s\n' "$HOME/.profile"
+      ;;
+  esac
+}
+
+ensure_path_in_shell_profile() {
+  local profile
+  profile="$(detect_shell_profile)"
+
+  mkdir -p "$(dirname "$profile")"
+  touch "$profile"
+
+  if grep -Fq '# >>> fastly_guardrails PATH >>>' "$profile" 2>/dev/null; then
+    info "PATH block already present in $profile"
+    return 0
+  fi
+
+  cat >> "$profile" <<'EOF'
+
+# >>> fastly_guardrails PATH >>>
+export PATH="$HOME/.local/bin:$PATH"
+# <<< fastly_guardrails PATH <<<
+EOF
+
+  success "Added ${LAUNCHER_DIR} to PATH in ${profile}"
+  info "Restart your shell or run: source \"$profile\""
+}
+
+confirm() {
+  local prompt="$1"
+  local assume_yes="${2:-0}"
+  if [[ "$assume_yes" -eq 1 ]]; then
+    return 0
+  fi
+  printf "%b" "${prompt} [y/N] "
+  read -r reply || true
+  [[ "$reply" =~ ^([yY]|yes|YES)$ ]]
+}
+
+record_receipt() {
+  local launcher_dir_created="$1"
+  local report_ready="$2"
+  mkdir -p "$INSTALL_ROOT"
+  : > "$RECEIPT_PATH"
+  printf 'version\t%s\n' '1' >> "$RECEIPT_PATH"
+  printf 'install_root\t%s\n' "$INSTALL_ROOT" >> "$RECEIPT_PATH"
+  printf 'launcher_path\t%s\n' "$LAUNCHER_PATH" >> "$RECEIPT_PATH"
+  printf 'launcher_dir_created\t%s\n' "$launcher_dir_created" >> "$RECEIPT_PATH"
+  printf 'report_ready\t%s\n' "$report_ready" >> "$RECEIPT_PATH"
+}
+
+read_receipt_value() {
+  local key="$1"
+  [[ -f "$RECEIPT_PATH" ]] || return 1
+  while IFS=$'\t' read -r receipt_key receipt_value; do
+    if [[ "$receipt_key" == "$key" ]]; then
+      printf '%s' "$receipt_value"
+      return 0
+    fi
+  done < "$RECEIPT_PATH"
+  return 1
+}
+
+is_managed_launcher() {
+  [[ -f "$1" ]] || return 1
+  grep -qF "$LAUNCHER_MARKER" "$1"
+}
+
+check_install_root_safety() {
+  ensure_safe_defaults
+  if [[ -e "$INSTALL_ROOT" && -L "$INSTALL_ROOT" ]]; then
+    die "Refusing to use symlinked install root: $INSTALL_ROOT"
+  fi
+  if [[ -e "$LAUNCHER_PATH" && -L "$LAUNCHER_PATH" ]]; then
+    die "Refusing to manage symlinked launcher: $LAUNCHER_PATH"
+  fi
+}
+
+find_python_candidate() {
+  local candidate version major minor
+  local candidates=()
+  [[ -n "${FASTLY_GUARDRAILS_PYTHON:-}" ]] && candidates+=("${FASTLY_GUARDRAILS_PYTHON}")
+  candidates+=(python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 python3.13 python3.12 python3.11 python3.10 python3.9)
+
+  for candidate in "${candidates[@]}"; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    version="$($candidate -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || true)"
+    [[ -n "$version" ]] || continue
+    major="${version%%.*}"
+    minor="${version##*.}"
+    if [[ "$major" -gt "$MIN_PYTHON_MAJOR" ]] || { [[ "$major" -eq "$MIN_PYTHON_MAJOR" ]] && [[ "$minor" -ge "$MIN_PYTHON_MINOR" ]]; }; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+maybe_install_python() {
+  local assume_yes="$1"
+  is_macos || die "Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+ not found. Install it and rerun install."
+  command -v brew >/dev/null 2>&1 || die "Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+ not found and Homebrew is unavailable. Install Homebrew or Python manually."
+  info "Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+ was not found."
+  if ! confirm "Install Homebrew Python now?" "$assume_yes"; then
+    die "Install aborted."
+  fi
+  brew install python
+}
+
+ensure_python() {
+  local assume_yes="$1"
+  local python_bin
+  if python_bin="$(find_python_candidate)"; then
+    printf '%s' "$python_bin"
+    return 0
+  fi
+  maybe_install_python "$assume_yes"
+  python_bin="$(find_python_candidate)" || die "Python installation completed, but a suitable python3 was still not found on PATH."
+  printf '%s' "$python_bin"
+}
+
+prepare_install_root() {
+  local launcher_dir_created=0
+  check_install_root_safety
+
+  if [[ -e "$INSTALL_ROOT" && ! -f "$SENTINEL_PATH" ]]; then
+    die "Refusing to install into an existing path not marked as managed: $INSTALL_ROOT"
+  fi
+
+  mkdir -p "$INSTALL_ROOT" "$CACHE_DIR"
+  printf '%s\n' 'fastly_guardrails managed root' > "$SENTINEL_PATH"
+
+  if [[ ! -d "$LAUNCHER_DIR" ]]; then
+    mkdir -p "$LAUNCHER_DIR"
+    launcher_dir_created=1
+  fi
+
+  if [[ -e "$LAUNCHER_PATH" ]] && ! is_managed_launcher "$LAUNCHER_PATH"; then
+    die "A non-managed file already exists at $LAUNCHER_PATH. Refusing to overwrite it."
+  fi
+
+  printf '%s' "$launcher_dir_created"
+}
+
+install_or_update_app() {
+  local python_bin="$1"
+  local report_ready=0
+
+  [[ -f "$BUNDLED_APP_DIR/pyproject.toml" ]] || die "Bundled application source not found next to the bootstrapper. Re-run from the extracted bundle."
+
+  rm -rf "$APP_DIR" "$VENV_DIR"
+  mkdir -p "$APP_DIR"
+  cp -R "$BUNDLED_APP_DIR/." "$APP_DIR/"
+
+  info "Creating managed virtual environment..."
+  "$python_bin" -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
+
+  info "Installing Fastly Guardrails into the managed environment..."
+  if "$VENV_DIR/bin/python" -m pip install "${APP_DIR}${PIP_INSTALL_EXTRA}" >/dev/null; then
+    report_ready=1
+    success "Installed scanner and PDF reporting support."
+  else
+    warn "PDF reporting dependencies could not be installed. Falling back to scanner-only install."
+    "$VENV_DIR/bin/python" -m pip install "$APP_DIR" >/dev/null
+    report_ready=0
+  fi
+
+  printf '%s' "$report_ready"
+}
+
+install_launcher() {
+  cp "$SCRIPT_PATH" "$LAUNCHER_PATH"
+  chmod 755 "$LAUNCHER_PATH"
+}
+
+run_install() {
+  local assume_yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) assume_yes=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown install option: $1" ;;
+    esac
+    shift
+  done
+
+  ensure_safe_defaults
+
+  if [[ ! -d "$BUNDLED_APP_DIR" ]]; then
+    if [[ -f "$SENTINEL_PATH" ]]; then
+      success "Fastly Guardrails is already installed under ${INSTALL_ROOT}."
+      info "To refresh from a newer bundle, rerun install from that extracted bundle."
+      return 0
+    fi
+    die "This launcher cannot install because bundled app sources are not present. Use the extracted bootstrap bundle."
+  fi
+
+  local python_bin launcher_dir_created report_ready
+  python_bin="$(ensure_python "$assume_yes")"
+  info "Using Python: $python_bin"
+  launcher_dir_created="$(prepare_install_root)"
+  report_ready="$(install_or_update_app "$python_bin")"
+  install_launcher
+  record_receipt "$launcher_dir_created" "$report_ready"
+
+  success "Installation complete."
+  info "Managed root: $INSTALL_ROOT"
+  info "Launcher: $LAUNCHER_PATH"
+  if ! path_contains "$LAUNCHER_DIR"; then
+    warn "${LAUNCHER_DIR} is not currently in PATH."
+    if confirm "Add ${LAUNCHER_DIR} to your shell PATH automatically?" "$assume_yes"; then
+      ensure_path_in_shell_profile
+    else
+      info "Add this line to your shell profile manually:"
+      say '  export PATH="$HOME/.local/bin:$PATH"'
+    fi
+  fi
+}
+
+run_doctor() {
+  ensure_safe_defaults
+  say "${BOLD}Fastly Guardrails Doctor${RESET}"
+  say "  Home            : $HOME"
+  say "  Install root    : $INSTALL_ROOT"
+  say "  Launcher        : $LAUNCHER_PATH"
+  say "  Platform        : $(uname -s) / $(uname -m)"
+
+  if python_bin="$(find_python_candidate 2>/dev/null)"; then
+    say "  Python          : $python_bin ($($python_bin --version 2>&1))"
+  else
+    say "  Python          : ${YELLOW}not found${RESET}"
+  fi
+
+  if [[ -f "$SENTINEL_PATH" ]]; then
+    say "  Managed root    : ${GREEN}present${RESET}"
+  else
+    say "  Managed root    : ${YELLOW}not installed${RESET}"
+  fi
+
+  if [[ -x "$VENV_DIR/bin/python" ]]; then
+    say "  Managed Python  : $($VENV_DIR/bin/python --version 2>&1)"
+    if "$VENV_DIR/bin/python" -c 'import reportlab' >/dev/null 2>&1; then
+      say "  PDF support     : ${GREEN}ready${RESET}"
+    else
+      say "  PDF support     : ${YELLOW}not installed in managed environment${RESET}"
+    fi
+  else
+    say "  Managed Python  : ${YELLOW}missing${RESET}"
+  fi
+
+  if [[ -e "$LAUNCHER_PATH" ]]; then
+    if is_managed_launcher "$LAUNCHER_PATH"; then
+      say "  Launcher state  : ${GREEN}managed${RESET}"
+    else
+      say "  Launcher state  : ${YELLOW}exists but is not tool-managed${RESET}"
+    fi
+  else
+    say "  Launcher state  : ${YELLOW}missing${RESET}"
+  fi
+
+  if path_contains "$LAUNCHER_DIR"; then
+    say "  PATH            : ${GREEN}${LAUNCHER_DIR} present${RESET}"
+  else
+    say "  PATH            : ${YELLOW}${LAUNCHER_DIR} not in PATH${RESET}"
+  fi
+}
+
+remove_path() {
+  local path="$1"
+  local kind="$2"
+  local dry_run="$3"
+
+  [[ -n "$path" ]] || die "Refusing to remove an empty path."
+  case "$path" in
+    "$INSTALL_ROOT"|"$INSTALL_ROOT"/*|"$LAUNCHER_PATH"|"$LAUNCHER_DIR") ;;
+    *) die "Refusing to remove unexpected path: $path" ;;
+  esac
+
+  [[ "$path" != "/" && "$path" != "$HOME" && "$path" != "$HOME/.local" ]] || die "Refusing to remove unsafe path: $path"
+
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    info "Would remove ${kind}: $path"
+    return 0
+  fi
+
+  rm -rf -- "$path"
+  info "Removed ${kind}: $path"
+}
+
+run_uninstall() {
+  local dry_run=0
+  local purge=0
+  local assume_yes=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1 ;;
+      --purge) purge=1 ;;
+      --yes) assume_yes=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown uninstall option: $1" ;;
+    esac
+    shift
+  done
+
+  ensure_safe_defaults
+  check_install_root_safety
+
+  if [[ ! -f "$SENTINEL_PATH" ]]; then
+    die "No managed installation marker was found at $SENTINEL_PATH. Refusing to guess what to remove."
+  fi
+
+  if [[ -e "$LAUNCHER_PATH" ]] && ! is_managed_launcher "$LAUNCHER_PATH"; then
+    die "Refusing to remove a non-managed launcher at $LAUNCHER_PATH."
+  fi
+
+  local launcher_dir_created=0
+  if value="$(read_receipt_value launcher_dir_created 2>/dev/null || true)"; then
+    launcher_dir_created="$value"
+  fi
+
+  say "${BOLD}Fastly Guardrails uninstall${RESET}"
+  say "  Install root : $INSTALL_ROOT"
+  say "  Launcher     : $LAUNCHER_PATH"
+  [[ "$purge" -eq 1 ]] && say "  Mode         : purge"
+  [[ "$dry_run" -eq 1 ]] && say "  Mode         : dry-run"
+
+  if [[ "$dry_run" -ne 1 ]] && ! confirm "Proceed with uninstall?" "$assume_yes"; then
+    die "Uninstall aborted."
+  fi
+
+  remove_path "$LAUNCHER_PATH" "launcher" "$dry_run"
+  remove_path "$INSTALL_ROOT" "managed install root" "$dry_run"
+
+  if [[ "$launcher_dir_created" == "1" && -d "$LAUNCHER_DIR" ]]; then
+    if [[ -z "$(find "$LAUNCHER_DIR" -mindepth 1 -maxdepth 1 2>/dev/null)" ]]; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        info "Would remove empty launcher directory: $LAUNCHER_DIR"
+      else
+        rmdir "$LAUNCHER_DIR" || true
+        info "Removed empty launcher directory: $LAUNCHER_DIR"
+      fi
+    fi
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    success "Dry-run complete. No changes made."
+  else
+    success "Uninstall complete."
+  fi
+}
+
+delegate_to_managed_python() {
+  [[ -x "$VENV_DIR/bin/python" ]] || die "Fastly Guardrails is not installed. Run './fastly_guardrails install' from the extracted bundle first."
+  exec "$VENV_DIR/bin/python" -m "$APP_MODULE" "$@"
+}
+
+main() {
+  local cmd="${1:-help}"
+  case "$cmd" in
+    install)
+      shift
+      run_install "$@"
+      ;;
+    uninstall)
+      shift
+      run_uninstall "$@"
+      ;;
+    doctor)
+      shift
+      run_doctor "$@"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      delegate_to_managed_python "$@"
+      ;;
+  esac
+}
+
+main "$@"

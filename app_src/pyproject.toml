@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastly-guardrails"
+version = "0.3.0"
+description = "Heuristic Fastly safety scanner for Terraform and VCL"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+report = ["reportlab>=4,<5"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+fastly_guardrails = ["data/*.json"]
