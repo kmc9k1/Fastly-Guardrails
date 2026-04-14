@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from .detectors import SignalEngine
+from typing import Optional, Set
+
+from .engine.registry import load_signals
+from .engine.signal_engine import SignalEngine
 from .models import Finding
 from .parser import collect_documents
-from .registry import load_signals
 from .utils import severity_rank
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 
@@ -39,6 +39,8 @@ class Signal:
     patterns: List[str] = field(default_factory=list)
     boosters: List[str] = field(default_factory=list)
     suppressors: List[str] = field(default_factory=list)
+    params: Dict[str, Any] = field(default_factory=dict)
+    custom_detector: Optional[str] = None
 
 
 @dataclass

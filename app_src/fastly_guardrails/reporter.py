@@ -6,7 +6,7 @@ import sys
 from collections import Counter
 from typing import Iterable, List
 
-from .grouping import consolidate_findings
+from .engine.grouping import consolidate_findings
 from .models import Finding
 from .utils import severity_rank
 

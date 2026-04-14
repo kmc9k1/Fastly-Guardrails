@@ -23,7 +23,7 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from .grouping import consolidate_findings
+from .engine.grouping import consolidate_findings
 from .models import Finding
 from .utils import severity_rank
 
