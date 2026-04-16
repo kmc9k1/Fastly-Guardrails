@@ -1,3 +1,0 @@
-
-[report]
-reportlab<5,>=4

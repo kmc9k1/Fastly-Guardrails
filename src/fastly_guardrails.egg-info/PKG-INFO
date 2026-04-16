@@ -1,7 +1,0 @@
-Metadata-Version: 2.4
-Name: fastly-guardrails
-Version: 1.0.0
-Summary: Heuristic Fastly safety scanner for Terraform and VCL
-Requires-Python: >=3.9
-Provides-Extra: report
-Requires-Dist: reportlab<5,>=4; extra == "report"

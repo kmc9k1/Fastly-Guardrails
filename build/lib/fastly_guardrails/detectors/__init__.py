@@ -1,1 +1,0 @@
-# custom detector package
