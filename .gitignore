@@ -1,6 +1,22 @@
+# Python bytecode / caches
 __pycache__/
-*.pyc
-.pytest_cache/
+*.py[cod]
+
+# Virtual environments
 .venv/
 .venv-test/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# OS/editor noise
 .DS_Store
