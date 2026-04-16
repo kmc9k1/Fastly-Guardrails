@@ -127,7 +127,7 @@ The wizard currently works best for:
 
 For more specialized detectors, custom detector logic may still be appropriate.
 
-For a detailed walkthrough of the wizard flow, see `WIZARD_README.md`.
+For a detailed walkthrough of the wizard flow, see [WIZARD_README.md](https://github.com/kmc9k1/Fastly-Guardrails/blob/main/WIZARD_README.md).
 
 ## Bootstrap support
 
