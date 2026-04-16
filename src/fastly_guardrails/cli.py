@@ -82,6 +82,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command is None:
         parser.print_help()
+        print("\nFor bootstrap help, run: fastly_guardrails_bootstrap --bootstrap-help")
         return 0
 
     if args.command == "create-detector":
