@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_CMD_NAME="fastly_guardrails"
+BOOTSTRAP_CMD_NAME="fastly_guardrails_bootstrap"
+MIN_PYTHON_MAJOR=3
+MIN_PYTHON_MINOR=9
+INSTALL_ROOT="${HOME}/.fastly_guardrails"
+VENV_DIR="${INSTALL_ROOT}/venv"
+WORKSPACE_DIR="${INSTALL_ROOT}/workspace"
+STATE_DIR="${INSTALL_ROOT}/state"
+LOGS_DIR="${INSTALL_ROOT}/logs"
+SENTINEL_PATH="${INSTALL_ROOT}/.fg_managed_root"
+RECEIPT_PATH="${STATE_DIR}/install_receipt.json"
+LAUNCHER_DIR="${HOME}/.local/bin"
+APP_LAUNCHER_PATH="${LAUNCHER_DIR}/${APP_CMD_NAME}"
+BOOTSTRAP_LAUNCHER_PATH="${LAUNCHER_DIR}/${BOOTSTRAP_CMD_NAME}"
+PATH_BLOCK_START="# >>> fastly_guardrails PATH >>>"
+PATH_BLOCK_END="# <<< fastly_guardrails PATH <<<"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)"
+BUNDLE_ROOT="${SCRIPT_DIR}"
+BUNDLE_PYPROJECT="${BUNDLE_ROOT}/pyproject.toml"
+BUNDLE_FIXTURES_DIR="${BUNDLE_ROOT}/tests/fixtures"
+
+USE_COLOR=0
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  USE_COLOR=1
+fi
+if [[ "$USE_COLOR" -eq 1 ]]; then
+  BOLD=$'\033[1m'; RESET=$'\033[0m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'
+else
+  BOLD=""; RESET=""; RED=""; GREEN=""; YELLOW=""; CYAN=""
+fi
+
+say() { printf "%b\n" "$*"; }
+info() { printf "%b\n" "${CYAN}•${RESET} $*"; }
+success() { printf "%b\n" "${GREEN}✓${RESET} $*"; }
+warn() { printf "%b\n" "${YELLOW}▲${RESET} $*" >&2; }
+die() { printf "%b\n" "${RED}ERROR:${RESET} $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+${BOLD}Fastly Guardrails Bootstrapper${RESET}
+
+Usage:
+  ./fastly_guardrails_bootstrap install [--yes]
+  fastly_guardrails_bootstrap doctor
+  fastly_guardrails_bootstrap uninstall [--dry-run] [--yes]
+  fastly_guardrails_bootstrap --bootstrap-help
+
+Notes:
+  • Install creates a managed runtime at ${INSTALL_ROOT}
+  • The application launcher is installed at ${APP_LAUNCHER_PATH}
+  • The bootstrap launcher is installed at ${BOOTSTRAP_LAUNCHER_PATH}
+  • Normal product commands are run through: fastly_guardrails
+EOF
+}
+
+ensure_safe_defaults() {
+  [[ -n "$HOME" ]] || die "HOME is not set."
+  [[ "$INSTALL_ROOT" == "$HOME/.fastly_guardrails" ]] || die "Install root safety check failed."
+  [[ "$APP_LAUNCHER_PATH" == "$HOME/.local/bin/${APP_CMD_NAME}" ]] || die "App launcher path safety check failed."
+  [[ "$BOOTSTRAP_LAUNCHER_PATH" == "$HOME/.local/bin/${BOOTSTRAP_CMD_NAME}" ]] || die "Bootstrap launcher path safety check failed."
+}
+
+path_contains() {
+  local needle="$1"
+  case ":$PATH:" in
+    *":${needle}:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_shell_profile() {
+  local shell_name
+  shell_name="$(basename "${SHELL:-}")"
+  case "$shell_name" in
+    zsh) printf '%s\n' "$HOME/.zshrc" ;;
+    bash)
+      if [[ -f "$HOME/.bash_profile" || ! -f "$HOME/.bashrc" ]]; then
+        printf '%s\n' "$HOME/.bash_profile"
+      else
+        printf '%s\n' "$HOME/.bashrc"
+      fi
+      ;;
+    *) printf '%s\n' "$HOME/.profile" ;;
+  esac
+}
+
+ensure_path_in_shell_profile() {
+  local profile="$1"
+  mkdir -p "$(dirname "$profile")"
+  touch "$profile"
+  if grep -Fq "$PATH_BLOCK_START" "$profile" 2>/dev/null; then
+    info "PATH block already present in $profile"
+    return 0
+  fi
+  cat >> "$profile" <<EOF
+
+$PATH_BLOCK_START
+export PATH="\$HOME/.local/bin:\$PATH"
+$PATH_BLOCK_END
+EOF
+  success "Added ${LAUNCHER_DIR} to PATH in ${profile}"
+  info "Restart your shell or run: source \"$profile\""
+}
+
+remove_path_block() {
+  local profile="$1"
+  [[ -f "$profile" ]] || return 0
+  python3 - "$profile" "$PATH_BLOCK_START" "$PATH_BLOCK_END" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+start = sys.argv[2]
+end = sys.argv[3]
+lines = path.read_text().splitlines()
+out = []
+skip = False
+for line in lines:
+    if line == start:
+        skip = True
+        continue
+    if skip and line == end:
+        skip = False
+        continue
+    if not skip:
+        out.append(line)
+text = "\n".join(out).rstrip() + "\n" if out else ""
+path.write_text(text)
+PY
+}
+
+confirm() {
+  local prompt="$1"
+  local assume_yes="${2:-0}"
+  if [[ "$assume_yes" -eq 1 ]]; then
+    return 0
+  fi
+  printf "%b" "${prompt} [y/N] "
+  read -r reply || true
+  [[ "$reply" =~ ^([yY]|yes|YES)$ ]]
+}
+
+find_python_candidate() {
+  local candidate version major minor
+  local candidates=()
+  [[ -n "${FASTLY_GUARDRAILS_PYTHON:-}" ]] && candidates+=("${FASTLY_GUARDRAILS_PYTHON}")
+  candidates+=(python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 python3.13 python3.12 python3.11 python3.10 python3.9)
+  for candidate in "${candidates[@]}"; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    version="$($candidate -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || true)"
+    [[ -n "$version" ]] || continue
+    major="${version%%.*}"
+    minor="${version##*.}"
+    if [[ "$major" -gt "$MIN_PYTHON_MAJOR" ]] || { [[ "$major" -eq "$MIN_PYTHON_MAJOR" ]] && [[ "$minor" -ge "$MIN_PYTHON_MINOR" ]]; }; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+maybe_install_python() {
+  local assume_yes="$1"
+  [[ "$(uname -s)" == "Darwin" ]] || die "Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+ not found. Install it and rerun install."
+  command -v brew >/dev/null 2>&1 || die "Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+ not found and Homebrew is unavailable. Install Homebrew or Python manually."
+  info "Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+ was not found."
+  if ! confirm "Install Homebrew Python now?" "$assume_yes"; then
+    die "Install aborted."
+  fi
+  brew install python
+}
+
+ensure_python() {
+  local assume_yes="$1"
+  local python_bin
+  if python_bin="$(find_python_candidate)"; then
+    printf '%s' "$python_bin"
+    return 0
+  fi
+  maybe_install_python "$assume_yes"
+  python_bin="$(find_python_candidate)" || die "Python installation completed, but a suitable python3 was still not found on PATH."
+  printf '%s' "$python_bin"
+}
+
+write_json_receipt() {
+  local report_ready="$1"
+  local path_block_added="$2"
+  local profile_path="$3"
+  mkdir -p "$STATE_DIR"
+  cat > "$RECEIPT_PATH" <<EOF
+{
+  "install_root": "${INSTALL_ROOT}",
+  "venv_dir": "${VENV_DIR}",
+  "workspace_dir": "${WORKSPACE_DIR}",
+  "app_launcher_path": "${APP_LAUNCHER_PATH}",
+  "bootstrap_launcher_path": "${BOOTSTRAP_LAUNCHER_PATH}",
+  "report_ready": ${report_ready},
+  "path_block_added": ${path_block_added},
+  "profile_path": "${profile_path}"
+}
+EOF
+}
+
+seed_workspace() {
+  mkdir -p "$WORKSPACE_DIR/tests/fixtures" "$WORKSPACE_DIR/tests/fixtures/generated" "$WORKSPACE_DIR/tests/manifests" "$WORKSPACE_DIR/fastly_guardrails/data" "$STATE_DIR" "$LOGS_DIR"
+  if [[ -d "$BUNDLE_FIXTURES_DIR/sample_repo" ]]; then
+    rm -rf "$WORKSPACE_DIR/tests/fixtures/sample_repo"
+    cp -R "$BUNDLE_FIXTURES_DIR/sample_repo" "$WORKSPACE_DIR/tests/fixtures/sample_repo"
+  fi
+}
+
+install_app_launcher() {
+  mkdir -p "$LAUNCHER_DIR"
+  cat > "$APP_LAUNCHER_PATH" <<EOF
+#!/usr/bin/env bash
+export FASTLY_GUARDRAILS_HOME="${INSTALL_ROOT}"
+exec "${VENV_DIR}/bin/fastly_guardrails" "\$@"
+EOF
+  chmod 755 "$APP_LAUNCHER_PATH"
+}
+
+install_bootstrap_launcher() {
+  mkdir -p "$LAUNCHER_DIR"
+  python3 - "$BOOTSTRAP_LAUNCHER_PATH" "$INSTALL_ROOT" "$APP_LAUNCHER_PATH" "$BOOTSTRAP_LAUNCHER_PATH" "$RECEIPT_PATH" "$PATH_BLOCK_START" "$PATH_BLOCK_END" "$VENV_DIR" "$WORKSPACE_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+install_root = sys.argv[2]
+app_launcher = sys.argv[3]
+bootstrap_launcher = sys.argv[4]
+receipt_path = sys.argv[5]
+path_block_start = sys.argv[6]
+path_block_end = sys.argv[7]
+venv_dir = sys.argv[8]
+workspace_dir = sys.argv[9]
+
+script = f'''#!/usr/bin/env bash
+set -euo pipefail
+INSTALL_ROOT="{install_root}"
+APP_LAUNCHER_PATH="{app_launcher}"
+BOOTSTRAP_LAUNCHER_PATH="{bootstrap_launcher}"
+RECEIPT_PATH="{receipt_path}"
+PATH_BLOCK_START="{path_block_start}"
+PATH_BLOCK_END="{path_block_end}"
+VENV_DIR="{venv_dir}"
+WORKSPACE_DIR="{workspace_dir}"
+usage() {{
+  cat <<USAGE
+Fastly Guardrails Bootstrapper
+
+Usage:
+  fastly_guardrails_bootstrap doctor
+  fastly_guardrails_bootstrap uninstall [--dry-run] [--yes]
+  fastly_guardrails_bootstrap --bootstrap-help
+
+To install or upgrade Fastly Guardrails, run the downloaded bootstrap bundle:
+  ./fastly_guardrails_bootstrap install
+USAGE
+}}
+run_doctor() {{
+  echo "Fastly Guardrails Doctor"
+  echo "  Install root     : ${{INSTALL_ROOT}}"
+  echo "  App launcher     : ${{APP_LAUNCHER_PATH}}"
+  echo "  Bootstrap launch : ${{BOOTSTRAP_LAUNCHER_PATH}}"
+  if [[ -x "${{VENV_DIR}}/bin/python" ]]; then
+    echo "  Managed Python   : $("${{VENV_DIR}}/bin/python" --version 2>&1)"
+  else
+    echo "  Managed Python   : missing"
+  fi
+  if [[ -d "${{WORKSPACE_DIR}}" ]]; then
+    echo "  Workspace        : present"
+  else
+    echo "  Workspace        : missing"
+  fi
+}}
+remove_path_block() {{
+  local profile="$1"
+  [[ -f "$profile" ]] || return 0
+  python3 - "$profile" "$PATH_BLOCK_START" "$PATH_BLOCK_END" <<'INNER'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+start = sys.argv[2]
+end = sys.argv[3]
+lines = path.read_text().splitlines()
+out = []
+skip = False
+for line in lines:
+    if line == start:
+        skip = True
+        continue
+    if skip and line == end:
+        skip = False
+        continue
+    if not skip:
+        out.append(line)
+text = "\\n".join(out).rstrip() + "\\n" if out else ""
+path.write_text(text)
+INNER
+}}
+run_uninstall() {{
+  local dry_run=0
+  local assume_yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1 ;;
+      --yes) assume_yes=1 ;;
+      *) usage; exit 2 ;;
+    esac
+    shift
+  done
+  if [[ "$dry_run" -eq 1 ]]; then
+    echo "Would remove launcher: ${{APP_LAUNCHER_PATH}}"
+    echo "Would remove launcher: ${{BOOTSTRAP_LAUNCHER_PATH}}"
+    echo "Would remove install root: ${{INSTALL_ROOT}}"
+    exit 0
+  fi
+  if [[ "$assume_yes" -ne 1 ]]; then
+    printf 'Proceed with uninstall? [y/N] '
+    read -r reply || true
+    [[ "$reply" =~ ^([yY]|yes|YES)$ ]] || {{ echo "Uninstall aborted."; exit 1; }}
+  fi
+  if [[ -f "$RECEIPT_PATH" ]]; then
+    profile=$(python3 - "$RECEIPT_PATH" <<'INNER'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if path.exists():
+    data = json.loads(path.read_text())
+    if data.get('path_block_added') and data.get('profile_path'):
+        print(data['profile_path'])
+INNER
+)
+    if [[ -n "${{profile:-}}" ]]; then
+      remove_path_block "$profile"
+    fi
+  fi
+  rm -f "${{APP_LAUNCHER_PATH}}" "${{BOOTSTRAP_LAUNCHER_PATH}}"
+  rm -rf "${{INSTALL_ROOT}}"
+  echo "Uninstall complete."
+}}
+case "${{1:-}}" in
+  doctor) shift; run_doctor ;;
+  uninstall) shift; run_uninstall "$@" ;;
+  --bootstrap-help) usage ;;
+  *) usage ;;
+esac
+'''
+path.write_text(script)
+path.chmod(0o755)
+PY
+}
+
+perform_install() {
+  local python_bin="$1"
+  [[ -f "$BUNDLE_PYPROJECT" ]] || die "Bundle root does not contain pyproject.toml. Run install from the extracted Fastly Guardrails bundle."
+  mkdir -p "$INSTALL_ROOT" "$STATE_DIR" "$LOGS_DIR"
+  printf '%s\n' 'fastly_guardrails managed root' > "$SENTINEL_PATH"
+  rm -rf "$VENV_DIR"
+  "$python_bin" -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null
+  info "Installing Fastly Guardrails into the managed environment..."
+  "$VENV_DIR/bin/python" -m pip install "${BUNDLE_ROOT}[report]" >/dev/null
+  seed_workspace
+}
+
+run_install() {
+  local assume_yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) assume_yes=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown install option: $1" ;;
+    esac
+    shift
+  done
+  ensure_safe_defaults
+  local python_bin profile path_block_added=0
+  python_bin="$(ensure_python "$assume_yes")"
+  info "Using Python: $python_bin"
+  perform_install "$python_bin"
+  install_app_launcher
+  install_bootstrap_launcher
+  profile="$(detect_shell_profile)"
+  if ! path_contains "$LAUNCHER_DIR"; then
+    if confirm "Add ${LAUNCHER_DIR} to your shell PATH automatically?" "$assume_yes"; then
+      ensure_path_in_shell_profile "$profile"
+      path_block_added=1
+    else
+      info "Add this line to your shell profile manually:"
+      say '  export PATH="$HOME/.local/bin:$PATH"'
+    fi
+  fi
+  write_json_receipt true "$path_block_added" "$profile"
+  success "Installation complete."
+  info "Managed root: $INSTALL_ROOT"
+  info "Application launcher: $APP_LAUNCHER_PATH"
+  info "Bootstrap launcher: $BOOTSTRAP_LAUNCHER_PATH"
+}
+
+run_doctor() {
+  ensure_safe_defaults
+  say "${BOLD}Fastly Guardrails Doctor${RESET}"
+  say "  Install root       : $INSTALL_ROOT"
+  say "  Workspace          : $WORKSPACE_DIR"
+  say "  App launcher       : $APP_LAUNCHER_PATH"
+  say "  Bootstrap launcher : $BOOTSTRAP_LAUNCHER_PATH"
+  if python_bin="$(find_python_candidate 2>/dev/null)"; then
+    say "  System Python      : $($python_bin --version 2>&1)"
+  fi
+  if [[ -x "$VENV_DIR/bin/python" ]]; then
+    say "  Managed Python     : $($VENV_DIR/bin/python --version 2>&1)"
+    if "$VENV_DIR/bin/python" -c 'import reportlab' >/dev/null 2>&1; then
+      say "  PDF support        : ready"
+    else
+      say "  PDF support        : missing"
+    fi
+  else
+    say "  Managed Python     : missing"
+  fi
+  if [[ -d "$WORKSPACE_DIR/tests/fixtures/sample_repo" ]]; then
+    say "  Sample fixture     : present"
+  else
+    say "  Sample fixture     : missing"
+  fi
+}
+
+run_uninstall() {
+  local dry_run=0
+  local assume_yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1 ;;
+      --yes) assume_yes=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown uninstall option: $1" ;;
+    esac
+    shift
+  done
+  ensure_safe_defaults
+  [[ -f "$SENTINEL_PATH" ]] || die "No managed installation marker was found at $SENTINEL_PATH. Refusing to guess what to remove."
+  if [[ "$dry_run" -eq 1 ]]; then
+    say "Would remove launcher: $APP_LAUNCHER_PATH"
+    say "Would remove launcher: $BOOTSTRAP_LAUNCHER_PATH"
+    say "Would remove install root: $INSTALL_ROOT"
+    return 0
+  fi
+  if ! confirm "Proceed with uninstall?" "$assume_yes"; then
+    die "Uninstall aborted."
+  fi
+  if [[ -f "$RECEIPT_PATH" ]]; then
+    local profile path_block_added
+    profile="$(python3 - "$RECEIPT_PATH" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if path.exists():
+    data = json.loads(path.read_text())
+    print(data.get('profile_path', ''))
+PY
+)"
+    path_block_added="$(python3 - "$RECEIPT_PATH" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if path.exists():
+    data = json.loads(path.read_text())
+    print('1' if data.get('path_block_added') else '0')
+PY
+)"
+    if [[ "$path_block_added" == "1" && -n "$profile" ]]; then
+      remove_path_block "$profile" >/dev/null || true
+    fi
+  fi
+  rm -f "$APP_LAUNCHER_PATH" "$BOOTSTRAP_LAUNCHER_PATH"
+  rm -rf "$INSTALL_ROOT"
+  success "Uninstall complete."
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    install) shift; run_install "$@" ;;
+    doctor) shift; run_doctor "$@" ;;
+    uninstall) shift; run_uninstall "$@" ;;
+    --bootstrap-help|-h|--help|help|"") usage ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"

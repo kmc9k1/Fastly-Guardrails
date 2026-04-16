@@ -1,0 +1,2 @@
+[console_scripts]
+fastly_guardrails = fastly_guardrails.cli:main
